@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "WS DOM Controller",
+  "version": "1.0.0",
+  "description": "Listens on a WebSocket and performs DOM actions: nav, click, type, set, exists, get_html, exec_js. Replies with results/errors.",
+  "permissions": [
+    "scripting",
+    "tabs",
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "WS DOM Controller"
+  }
+}

@@ -1,0 +1,273 @@
+what you need
+
+the folder you already have: ws-dom-controller/extension
+
+Google Chrome
+
+the tiny server from before (we’ll use it to send commands)
+
+step 1 — open the right file
+
+open the folder: ws-dom-controller/extension
+
+open the file called background.js in any editor (VS Code, Notepad, anything).
+
+step 2 — find the “handlers” box
+
+press Ctrl+F (or Cmd+F) and search for this text:
+
+const handlers = {
+
+
+This is a big object with many commands like nav, click, type, etc.
+
+step 3 — paste the new “xpath” power inside the box
+
+inside that big handlers = { ... } box, go to the end but before the final } of the box.
+
+if the last command doesn’t end with a comma , add a comma.
+
+paste this entire block:
+
+  // NEW: XPath lookup & actions
+  // { expr: string, action?: 'list'|'click'|'exists'|'count'|'getAttribute'|'getHTML'|'getText'|'setValue'|'type',
+  //   index?: number, timeout_ms?: number, attr?: string, text?: string, clear?: boolean, enter?: boolean,
+  //   max?: number, includeHTML?: boolean, max_len?: number }
+  async xpath(payload, tabId) {
+    return await runInPage(
+      tabId,
+      async (p) => {
+        const {
+          expr,
+          action = 'list',
+          index = 0,
+          timeout_ms = 2000,
+          attr,
+          text = '',
+          clear = true,
+          enter = false,
+          max = 10,
+          includeHTML = false,
+          max_len = 500000
+        } = p || {};
+
+        if (!expr || typeof expr !== 'string') {
+          throw new Error('xpath: missing "expr"');
+        }
+
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        function evalSnapshot(xp) {
+          try {
+            return document.evaluate(xp, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+          } catch (e) {
+            throw new Error('Invalid XPath: ' + e.message);
+          }
+        }
+
+        async function waitForIndex(xp, idx, timeout) {
+          const start = performance.now();
+          while (performance.now() - start < timeout) {
+            const snap = evalSnapshot(xp);
+            if (snap.snapshotLength > idx) return snap;
+            await sleep(100);
+          }
+          return evalSnapshot(xp);
+        }
+
+        function summarizeNode(node) {
+          try {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              const el = node;
+              const rect = el.getBoundingClientRect();
+              const html = includeHTML ? (el.outerHTML || '') : undefined;
+              const truncated = includeHTML && html.length > max_len;
+              return {
+                nodeType: 'element',
+                tag: el.tagName,
+                id: el.id || null,
+                classes: el.className || null,
+                name: el.getAttribute('name') || null,
+                value: ('value' in el) ? el.value : null,
+                rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                html: includeHTML ? (truncated ? html.slice(0, max_len) : html) : undefined,
+                html_truncated: includeHTML ? truncated : undefined
+              };
+            }
+            if (node.nodeType === Node.TEXT_NODE) {
+              const t = node.nodeValue || '';
+              return { nodeType: 'text', text: t.slice(0, 200) };
+            }
+            return { nodeType: 'other', nodeName: node.nodeName };
+          } catch {
+            return { nodeType: 'unknown' };
+          }
+        }
+
+        // Resolve snapshot (wait if needed for actions that target a specific index)
+        const needsIndex = ['click', 'getAttribute', 'getHTML', 'getText', 'setValue', 'type'].includes(action);
+        const snap = needsIndex ? await waitForIndex(expr, index, timeout_ms) : evalSnapshot(expr);
+        const count = snap.snapshotLength;
+
+        // Helpers
+        function nth(idx) {
+          if (idx >= count) return null;
+          return snap.snapshotItem(idx);
+        }
+        function ensureElement(node) {
+          if (!node || node.nodeType !== Node.ELEMENT_NODE) throw new Error('Target is not an element node');
+          return node;
+        }
+
+        switch (action) {
+          case 'list': {
+            const out = [];
+            const n = Math.min(count, Math.max(0, max));
+            for (let i = 0; i < n; i++) out.push(summarizeNode(snap.snapshotItem(i)));
+            return { count, nodes: out };
+          }
+          case 'exists':
+            return { exists: count > 0 };
+          case 'count':
+            return { count };
+          case 'click': {
+            const node = ensureElement(nth(index));
+            node.scrollIntoView({ block: 'center', inline: 'center' });
+            const r = node.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click'].forEach(type => {
+              node.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: cx, clientY: cy }));
+            });
+            return { clicked: true };
+          }
+          case 'getAttribute': {
+            if (!attr) throw new Error('getAttribute requires "attr"');
+            const node = ensureElement(nth(index));
+            return { value: node.getAttribute(attr) };
+          }
+          case 'getHTML': {
+            const node = ensureElement(nth(index));
+            const html = node.outerHTML || {};
+            const truncated = html.length > max_len;
+            return { html: truncated ? html.slice(0, max_len) : html, truncated, length: html.length };
+          }
+          case 'getText': {
+            const node = nth(index);
+            if (!node) throw new Error('No node at index');
+            const txt = node.textContent || '';
+            return { text: txt, length: txt.length };
+          }
+          case 'setValue': {
+            const node = nth(index);
+            if (!node) throw new Error('No node at index');
+            if (node.nodeType === Node.ELEMENT_NODE && 'value' in node) {
+              node.value = text;
+              node.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
+              node.dispatchEvent(new Event('change', { bubbles: true }));
+              return { set: true };
+            } else {
+              node.textContent = text;
+              return { set: true };
+            }
+          }
+          case 'type': {
+            const node = ensureElement(nth(index));
+            node.focus();
+            if (clear && 'value' in node) node.value = '';
+            for (const ch of text) {
+              node.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true }));
+              if ('value' in node) node.value += ch;
+              node.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch }));
+              node.dispatchEvent(new KeyboardEvent('keypress', { key: ch, bubbles: true }));
+              node.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true }));
+              await sleep(5);
+            }
+            node.dispatchEvent(new Event('change', { bubbles: true }));
+            if (enter) {
+              node.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+              node.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+            }
+            return { typed: true, length: text.length };
+          }
+          default:
+            throw new Error('Unknown xpath action: ' + action);
+        }
+      },
+      [payload]
+    );
+  }
+
+
+make sure there’s still a closing } for the handlers box after your pasted block.
+
+save the file.
+
+step 4 — reload the extension
+
+open Chrome and go to chrome://extensions
+
+find “WS DOM Controller”
+
+click the Reload button (little circular arrow)
+
+(If you don’t see it, turn on Developer mode at the top right.)
+
+step 5 — start the tiny server
+
+open a terminal:
+
+cd ws-dom-controller/server
+npm install
+npm start
+
+
+you should see: Listening on ws://localhost:8765
+
+step 6 — test XPath in 60 seconds
+A) open a page
+
+In the server window, type this line and press Enter:
+
+{"cmd":"nav","url":"https://example.org"}
+
+B) check if an <h1> exists (XPath)
+{"cmd":"xpath","expr":"//h1","action":"exists"}
+
+
+You should see a reply with "exists": true.
+
+C) list the first match with a small summary
+{"cmd":"xpath","expr":"//h1","action":"list","includeHTML":true,"max":1}
+
+D) read its text
+{"cmd":"xpath","expr":"//h1","action":"getText"}
+
+E) click a link (the first <a>)
+{"cmd":"xpath","expr":"//a","action":"click","index":0,"timeout_ms":5000}
+
+F) type into Google using XPath (bonus)
+{"cmd":"nav","url":"https://www.google.com"}
+
+
+If a cookie button appears, you can try:
+
+{"cmd":"click","selector":"button[aria-label='Accept all']","timeout_ms":8000}
+
+
+Now type:
+
+{"cmd":"xpath","expr":"//textarea[@name='q'] | //input[@name='q']","action":"type","text":"federated learning","enter":true,"timeout_ms":8000}
+
+
+tip: in JSON, use double quotes " around the whole line, and use single quotes ' inside the XPath when you need them (like @name='q').
+
+if something goes wrong
+
+“Unknown cmd: xpath” → you didn’t paste the block inside handlers, or you forgot the comma.
+
+syntax error → check that every { has a matching }, and that commands in handlers are separated by commas.
+
+nothing happens on page → try a longer timeout_ms or make sure your XPath matches the real elements.
+
+see errors → open chrome://extensions → find the extension → Service worker → Inspect → look at the console.
